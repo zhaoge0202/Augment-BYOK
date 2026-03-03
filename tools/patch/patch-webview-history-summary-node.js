@@ -14,21 +14,29 @@ function patchExtensionClientContextAsset(filePath) {
   if (original.includes(MARKER)) return { changed: false, reason: "already_patched" };
 
   // 上游 useHistorySummaryNew 会把 {history_end: tail exchanges(with nodes)} 存进 request_nodes 的 HISTORY_SUMMARY 节点。
-  // 该节点体积巨大，后续“Editable History / 编辑历史对话”等路径可能对 request_nodes 做 JSON.stringify/clone，导致内存爆炸→VSIX 崩溃。
+  // 该节点体积巨大，后续"Editable History / 编辑历史对话"等路径可能对 request_nodes 做 JSON.stringify/clone，导致内存爆炸→VSIX 崩溃。
   //
   // 修复策略：仍然生成同样的 summary payload（C），但存入 state 的节点改为 TEXT，并把 message_template 填充后的字符串写入 text_node.content。
   // 这样：语义保持（模型仍拿到同样的 supervisor prompt），同时避免把 history_end 的巨型结构长期挂在 state 上。
   let out = original;
 
-  // 兼容上游小版本变更：不强依赖整段变量名（N/F/aS/rS 等），只替换“把 payload C 存入 HISTORY_SUMMARY 节点”的那一小段。
-  // 目标：U={id:0,type:Ie.HISTORY_SUMMARY,history_summary_node:C} -> U={id:0,type:Ie.TEXT,text_node:{content:k3(C)}}
+  // 兼容上游小版本变更：不强依赖整段变量名（N/F/aS/rS 等），只替换"把 payload C 存入 HISTORY_SUMMARY 节点"的那一小段。
+  // 目标：U={id:0,type:Enum.HISTORY_SUMMARY,history_summary_node:C} -> U={id:0,type:Enum.TEXT,text_node:{content:renderFn(C)}}
   //
-  // NOTE: k3 是上游内部函数：把 summary payload 按 message_template 渲染为最终字符串。
-  const summaryNodeRe = /\{id:0,type:Ie\.HISTORY_SUMMARY,history_summary_node:([A-Za-z_$][0-9A-Za-z_$]*)\}/g;
+  // NOTE: renderFn（上游曾为 k3 / wK 等）是把 summary payload 按 message_template 渲染为最终字符串的内部函数。
+  //       enum 名（上游曾为 Ie / Ze 等）也随 minification 变化，此处均动态捕获。
+
+  // Step 1: 找 render 函数名（signature: function X(e){...e.history_end.map...}）
+  const renderFnMatch = out.match(/function\s+([A-Za-z_$][0-9A-Za-z_$]*)\([^)]*\)\{[^}]*\.history_end\.map/);
+  if (!renderFnMatch) throw new Error("extension-client-context: history summary render function not found (upstream may have changed)");
+  const renderFn = renderFnMatch[1];
+
+  // Step 2: 用动态 capture group 匹配 enum 名 + payload 变量
+  const summaryNodeRe = /\{id:0,type:([A-Za-z_$][0-9A-Za-z_$]*)\.HISTORY_SUMMARY,history_summary_node:([A-Za-z_$][0-9A-Za-z_$]*)\}/g;
   out = replaceOnceRegex(
     out,
     summaryNodeRe,
-    (m) => `{id:0,type:Ie.TEXT,text_node:{content:k3(${m[1]})}}`,
+    (m) => `{id:0,type:${m[1]}.TEXT,text_node:{content:${renderFn}(${m[2]})}}`,
     "extension-client-context HISTORY_SUMMARY node slimming"
   );
 
